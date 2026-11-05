@@ -63,3 +63,4 @@ poetry.toml
 ### Project-specific ###
 /data/
 experiments/*/results/
+/docs/

@@ -28,6 +28,10 @@ viz = [
     "matplotlib>=3.7",
     "mplsoccer>=1.2",
 ]
+nb = [
+    "jupyterlab>=4.0",
+    "ipykernel>=6.0",
+]
 
 [tool.uv.build-backend]
 module-name = "turf.efi"
