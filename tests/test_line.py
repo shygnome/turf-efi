@@ -11,11 +11,15 @@ from turf.efi.line import (
     detect_lines_frame,
     find_goalkeeper,
     fix_player_assignments,
+    infer_attacking_direction,
     smooth_line_assignments,
     vote_line_count,
 )
 
 # ── fixtures ──────────────────────────────────────────────────────────────────
+
+# GK in _event_df (player 3) is at x ≈ +43 → defends right, attacks left
+_EVENT_ATK_DIR = -1
 
 
 def _away_df(**players: float) -> pd.DataFrame:
@@ -24,7 +28,10 @@ def _away_df(**players: float) -> pd.DataFrame:
 
 
 def _event_df() -> pd.DataFrame:
-    """Five-frame event with GK (player 3) and two clear defensive lines."""
+    """Five-frame event with GK (player 3) and two clear defensive lines.
+
+    GK at x ≈ +43 → defends right goal → attacking_direction = -1.
+    """
     rows = []
     for f in range(5):
         row: dict[str, object] = {"frame": f, "Period": 1, "Time [s]": f * 0.033}
@@ -49,8 +56,9 @@ def _event_df() -> pd.DataFrame:
 
 class TestFindGoalkeeper:
     def test_defending_right_extreme_positive_x(self) -> None:
+        # Team defends right goal (GK at max positive x) → attacking_direction=-1
         df = _away_df(**{"2": 10.0, "3": 44.0, "4": 18.0})
-        assert find_goalkeeper(df, "Away") == "3"
+        assert find_goalkeeper(df, "Away", attacking_direction=-1) == "3"
 
     def test_majority_vote_overrides_bad_first_frame(self) -> None:
         # Frame 0: tracking swap — player 2 appears deep (wrong)
@@ -61,7 +69,9 @@ class TestFindGoalkeeper:
             {"Away_2_x": 10.0, "Away_3_x": 44.0},
             {"Away_2_x": 10.0, "Away_3_x": 44.0},
         ]
-        assert find_goalkeeper(pd.DataFrame(rows), "Away") == "3"
+        # GK (player 3) at x=44 → defends right → attacking_direction=-1
+        result = find_goalkeeper(pd.DataFrame(rows), "Away", attacking_direction=-1)
+        assert result == "3"
 
     def test_minority_bad_frames_do_not_flip_result(self) -> None:
         # 1 bad frame out of 5 should not change the result
@@ -72,16 +82,19 @@ class TestFindGoalkeeper:
             {"Away_1_x": 44.0, "Away_5_x": 10.0},  # correct
             {"Away_1_x": 44.0, "Away_5_x": 10.0},  # correct
         ]
-        assert find_goalkeeper(pd.DataFrame(rows), "Away") == "1"
+        # GK (player 1) at x=44 → defends right → attacking_direction=-1
+        result = find_goalkeeper(pd.DataFrame(rows), "Away", attacking_direction=-1)
+        assert result == "1"
 
     def test_defending_left_extreme_negative_x(self) -> None:
+        # Team defends left goal (GK at min negative x) → attacking_direction=+1
         df = _away_df(**{"2": -5.0, "3": -43.0, "4": -12.0})
-        assert find_goalkeeper(df, "Away") == "3"
+        assert find_goalkeeper(df, "Away", attacking_direction=1) == "3"
 
     def test_direction_aware_outfielder_pushed_into_opponent_half_right(self) -> None:
-        # Bug: team defends RIGHT (positive x). Real GK at +40, but outfielder
+        # Team defends RIGHT (positive x). Real GK at +40, but outfielder
         # (player 16) pushed all the way to -42. abs().idxmax() picks 16 (wrong).
-        # Direction-aware detection should pick player 1 (GK at +40).
+        # attacking_direction=-1 → use idxmax → correctly picks player 1 (GK at +40).
         rows = [
             {
                 "Away_1_x": 40.0,   # GK — defending right goal
@@ -89,10 +102,12 @@ class TestFindGoalkeeper:
                 "Away_2_x": 15.0, "Away_3_x": 10.0, "Away_4_x": 5.0,
             }
         ] * 5
-        assert find_goalkeeper(pd.DataFrame(rows), "Away") == "1"
+        result = find_goalkeeper(pd.DataFrame(rows), "Away", attacking_direction=-1)
+        assert result == "1"
 
     def test_direction_aware_outfielder_pushed_into_opponent_half_left(self) -> None:
         # Symmetric: team defends LEFT. GK at -40, outfielder at +42.
+        # attacking_direction=+1 → use idxmin → correctly picks player 1 (GK at -40).
         rows = [
             {
                 "Away_1_x": -40.0,  # GK — defending left goal
@@ -100,7 +115,40 @@ class TestFindGoalkeeper:
                 "Away_2_x": -15.0, "Away_3_x": -10.0, "Away_4_x": -5.0,
             }
         ] * 5
-        assert find_goalkeeper(pd.DataFrame(rows), "Away") == "1"
+        assert find_goalkeeper(pd.DataFrame(rows), "Away", attacking_direction=1) == "1"
+
+
+# ── infer_attacking_direction ─────────────────────────────────────────────────
+
+
+class TestInferAttackingDirection:
+    def test_gk_at_positive_x_returns_minus_one(self) -> None:
+        # GK at max positive x → team attacks toward negative x
+        df = _away_df(**{"1": 43.0, "2": 10.0, "3": 5.0})
+        assert infer_attacking_direction(df, "Away") == -1
+
+    def test_gk_at_negative_x_returns_plus_one(self) -> None:
+        # GK at min negative x → team attacks toward positive x
+        df = _away_df(**{"1": -43.0, "2": -10.0, "3": -5.0})
+        assert infer_attacking_direction(df, "Away") == 1
+
+    def test_uses_first_non_nan_frame(self) -> None:
+        # First frame is all NaN; second frame has valid positions
+        rows = [
+            {"Away_1_x": float("nan"), "Away_2_x": float("nan")},
+            {"Away_1_x": -42.0, "Away_2_x": 5.0},
+        ]
+        assert infer_attacking_direction(pd.DataFrame(rows), "Away") == 1
+
+    def test_no_matching_columns_raises(self) -> None:
+        df = pd.DataFrame([{"Home_1_x": 10.0}])
+        with pytest.raises(ValueError):
+            infer_attacking_direction(df, "Away")
+
+    def test_all_nan_raises(self) -> None:
+        df = pd.DataFrame([{"Away_1_x": float("nan"), "Away_2_x": float("nan")}])
+        with pytest.raises(ValueError):
+            infer_attacking_direction(df, "Away")
 
 
 # ── detect_lines_frame ────────────────────────────────────────────────────────
@@ -213,19 +261,20 @@ class TestDetectLinesFrame:
 class TestAnalyzeLines:
     def test_adds_line_column_for_each_player(self) -> None:
         df = _event_df()
-        result = analyze_lines(df, "Away")
+        result = analyze_lines(df, "Away", _EVENT_ATK_DIR)
         for pid in ["2", "3", "6", "7", "9", "10", "11"]:
             assert f"Away_{pid}_line" in result.columns
 
     def test_adds_line_count_column(self) -> None:
-        assert "line_count" in analyze_lines(_event_df(), "Away").columns
+        result = analyze_lines(_event_df(), "Away", _EVENT_ATK_DIR)
+        assert "line_count" in result.columns
 
     def test_gk_always_line_zero(self) -> None:
-        result = analyze_lines(_event_df(), "Away")
+        result = analyze_lines(_event_df(), "Away", _EVENT_ATK_DIR)
         assert (result["Away_3_line"] == 0).all()
 
     def test_outfield_lines_between_one_and_four(self) -> None:
-        result = analyze_lines(_event_df(), "Away")
+        result = analyze_lines(_event_df(), "Away", _EVENT_ATK_DIR)
         for pid in ["2", "6", "7", "9", "10", "11"]:
             vals = result[f"Away_{pid}_line"].dropna()
             assert vals.between(1, 4).all(), f"Player {pid} out-of-range line values"
@@ -234,7 +283,7 @@ class TestAnalyzeLines:
         df = _event_df()
         df["Away_14_x"] = np.nan
         df["Away_14_y"] = np.nan
-        result = analyze_lines(df, "Away")
+        result = analyze_lines(df, "Away", _EVENT_ATK_DIR)
         assert result["Away_14_line"].isna().all()
 
     def test_partially_present_player_nan_for_missing_frames(self) -> None:
@@ -242,19 +291,19 @@ class TestAnalyzeLines:
         df["Away_14_x"] = np.nan
         df["Away_14_y"] = np.nan
         df.loc[0:1, "Away_14_x"] = [12.0, 12.1]
-        result = analyze_lines(df, "Away")
+        result = analyze_lines(df, "Away", _EVENT_ATK_DIR)
         assert not pd.isna(result.loc[0, "Away_14_line"])
         assert pd.isna(result.loc[2, "Away_14_line"])
 
     def test_original_columns_preserved(self) -> None:
         df = _event_df()
-        result = analyze_lines(df, "Away")
+        result = analyze_lines(df, "Away", _EVENT_ATK_DIR)
         for col in df.columns:
             assert col in result.columns
 
     def test_row_count_unchanged(self) -> None:
         df = _event_df()
-        assert len(analyze_lines(df, "Away")) == len(df)
+        assert len(analyze_lines(df, "Away", _EVENT_ATK_DIR)) == len(df)
 
     def test_min_line_gap_propagated_to_frame_detection(self) -> None:
         # 3 close lines in event data: [10,11], [12,13], [25,26]
@@ -276,13 +325,13 @@ class TestAnalyzeLines:
                 row[f"Away_{pid}_y"] = float(y)
             rows.append(row)
         df = pd.DataFrame(rows)
-        result = analyze_lines(df, "Away", min_line_gap=5.0)
+        result = analyze_lines(df, "Away", _EVENT_ATK_DIR, min_line_gap=5.0)
         assert (result["line_count"] == 2).all()
 
     def test_absent_gk_gets_nan_line(self) -> None:
         df = _event_df()
         df.loc[2, "Away_3_x"] = np.nan
-        result = analyze_lines(df, "Away")
+        result = analyze_lines(df, "Away", _EVENT_ATK_DIR)
         assert pd.isna(result.loc[2, "Away_3_line"])
         assert result.loc[0, "Away_3_line"] == 0
 
@@ -293,7 +342,7 @@ class TestAnalyzeLines:
 class TestSmoothLineAssignments:
     def test_stable_assignments_unchanged(self) -> None:
         df = _event_df()
-        lined = analyze_lines(df, "Away")
+        lined = analyze_lines(df, "Away", _EVENT_ATK_DIR)
         result = smooth_line_assignments(lined, "Away", window=3)
         for pid in ["2", "6", "7", "9", "10", "11"]:
             col = f"Away_{pid}_line"
@@ -301,7 +350,7 @@ class TestSmoothLineAssignments:
 
     def test_single_frame_flicker_corrected(self) -> None:
         df = _event_df()
-        lined = analyze_lines(df, "Away")
+        lined = analyze_lines(df, "Away", _EVENT_ATK_DIR)
         # Inject a one-frame flip on player 2 (usually line 1)
         original_val = float(lined.at[2, "Away_2_line"])
         flipped_val = 3.0 if original_val != 3.0 else 1.0
@@ -312,34 +361,34 @@ class TestSmoothLineAssignments:
 
     def test_all_nan_stays_nan(self) -> None:
         df = _event_df()
-        lined = analyze_lines(df, "Away")
+        lined = analyze_lines(df, "Away", _EVENT_ATK_DIR)
         lined["Away_14_line"] = np.nan
         result = smooth_line_assignments(lined, "Away")
         assert result["Away_14_line"].isna().all()
 
     def test_non_line_columns_unchanged(self) -> None:
         df = _event_df()
-        lined = analyze_lines(df, "Away")
+        lined = analyze_lines(df, "Away", _EVENT_ATK_DIR)
         original_x = lined["Away_2_x"].tolist()
         result = smooth_line_assignments(lined, "Away")
         assert result["Away_2_x"].tolist() == original_x
 
     def test_returns_copy_not_mutation(self) -> None:
         df = _event_df()
-        lined = analyze_lines(df, "Away")
+        lined = analyze_lines(df, "Away", _EVENT_ATK_DIR)
         original = lined["Away_2_line"].tolist()
         smooth_line_assignments(lined, "Away")
         assert lined["Away_2_line"].tolist() == original
 
     def test_gk_line_zero_preserved(self) -> None:
         df = _event_df()
-        lined = analyze_lines(df, "Away")
+        lined = analyze_lines(df, "Away", _EVENT_ATK_DIR)
         result = smooth_line_assignments(lined, "Away")
         assert (result["Away_3_line"].dropna() == 0).all()
 
     def test_nan_positions_not_filled_by_smoothing(self) -> None:
         df = _event_df()
-        lined = analyze_lines(df, "Away")
+        lined = analyze_lines(df, "Away", _EVENT_ATK_DIR)
         # Inject NaN for player 2 at frame 2 (simulating mid-clip absence)
         lined.at[2, "Away_2_line"] = float("nan")
         result = smooth_line_assignments(lined, "Away", window=5)
@@ -353,24 +402,24 @@ class TestSmoothLineAssignments:
 class TestAnalyzeLinesForceNLines:
     def test_force_two_lines_gives_consistent_count(self) -> None:
         df = _event_df()
-        result = analyze_lines(df, "Away", force_n_lines=2)
+        result = analyze_lines(df, "Away", _EVENT_ATK_DIR, force_n_lines=2)
         assert (result["line_count"] == 2).all()
 
     def test_force_three_lines_gives_consistent_count(self) -> None:
         df = _event_df()
-        result = analyze_lines(df, "Away", force_n_lines=3)
+        result = analyze_lines(df, "Away", _EVENT_ATK_DIR, force_n_lines=3)
         assert (result["line_count"] == 3).all()
 
     def test_force_n_lines_none_matches_default(self) -> None:
         df = _event_df()
         pd.testing.assert_frame_equal(
-            analyze_lines(df, "Away"),
-            analyze_lines(df, "Away", force_n_lines=None),
+            analyze_lines(df, "Away", _EVENT_ATK_DIR),
+            analyze_lines(df, "Away", _EVENT_ATK_DIR, force_n_lines=None),
         )
 
     def test_force_n_lines_outfield_players_still_assigned(self) -> None:
         df = _event_df()
-        result = analyze_lines(df, "Away", force_n_lines=2)
+        result = analyze_lines(df, "Away", _EVENT_ATK_DIR, force_n_lines=2)
         for pid in ["2", "6", "7", "9", "10", "11"]:
             vals = result[f"Away_{pid}_line"].dropna()
             assert vals.between(1, 4).all()
@@ -398,7 +447,7 @@ class TestVoteLineCount:
 
     def test_two_line_count_from_real_event(self) -> None:
         df = _event_df()
-        lined = analyze_lines(df, "Away")
+        lined = analyze_lines(df, "Away", _EVENT_ATK_DIR)
         k = vote_line_count(lined)
         assert 1 <= k <= 4
 
@@ -452,7 +501,7 @@ class TestFixPlayerAssignments:
 
     def test_each_player_has_single_line_after_fix(self) -> None:
         df = _event_df()
-        lined = analyze_lines(df, "Away", force_n_lines=2)
+        lined = analyze_lines(df, "Away", _EVENT_ATK_DIR, force_n_lines=2)
         fixed = fix_player_assignments(lined, "Away")
         line_cols = [
             c for c in fixed.columns if c.startswith("Away_") and c.endswith("_line")

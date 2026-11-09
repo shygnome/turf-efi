@@ -8,15 +8,37 @@ import pandas as pd
 from scipy.cluster.hierarchy import fcluster, linkage  # type: ignore[import-untyped]
 
 
-def find_goalkeeper(df: pd.DataFrame, team: str) -> str:
+def infer_attacking_direction(df: pd.DataFrame, team: str) -> int:
+    """Return the attacking direction (+1 or -1) for team from full-period data.
+
+    **Must be called on full-period tracking data starting from kick-off**, not
+    on a short extracted clip.  At kick-off the GK is always in their own goal
+    and no outfield player is further back, so abs().idxmax() is reliable.
+
+    Returns +1 if the team attacks toward positive x (GK at the min-x end),
+    or -1 if the team attacks toward negative x (GK at the max-x end).
+
+    The result should be computed once per team per period and passed to
+    analyze_lines / find_goalkeeper for every clip derived from that period.
+    """
+    x_cols = [c for c in df.columns if c.startswith(team + "_") and c.endswith("_x")]
+    if not x_cols:
+        raise ValueError(f"No {team} player positions found in columns")
+    for _, row in df.iterrows():
+        valid = row[x_cols].dropna()
+        if not valid.empty:
+            gk_col = str(valid.abs().idxmax())
+            gk_x = float(valid[gk_col])
+            return 1 if gk_x < 0 else -1
+    raise ValueError(f"No {team} player positions in any frame")
+
+
+def find_goalkeeper(df: pd.DataFrame, team: str, attacking_direction: int) -> str:
     """Return player ID of the goalkeeper by majority vote across all frames.
 
-    Defending direction (which end of the pitch this team protects) is inferred
-    from the median player x across all frames: negative median → defending the
-    left goal (GK has the minimum x per frame); positive median → defending the
-    right goal (GK has the maximum x per frame).  Using the signed extreme rather
-    than abs().idxmax() prevents outfield players who push far into the opponent's
-    half from being misidentified as the goalkeeper.
+    attacking_direction: +1 if team attacks toward positive x (GK at min x end);
+                        -1 if team attacks toward negative x (GK at max x end).
+    Obtain this once via infer_attacking_direction(full_period_df, team).
 
     Majority vote across frames is robust to occasional tracklet swaps.
     """
@@ -24,19 +46,12 @@ def find_goalkeeper(df: pd.DataFrame, team: str) -> str:
     if not x_cols:
         raise ValueError(f"No {team} player positions found")
 
-    # Infer defending direction from overall median x
-    all_x: npt.NDArray[np.float64] = df[x_cols].values.flatten().astype(np.float64)
-    all_x = all_x[~np.isnan(all_x)]
-    if len(all_x) == 0:
-        raise ValueError(f"No {team} player positions in any frame")
-    defending_left: bool = bool(np.median(all_x) < 0)
-
     votes: dict[str, int] = {}
     for _, row in df.iterrows():
         valid = row[x_cols].dropna()
         if valid.empty:
             continue
-        gk_col = str(valid.idxmin() if defending_left else valid.idxmax())
+        gk_col = str(valid.idxmin() if attacking_direction == 1 else valid.idxmax())
         player_num = gk_col.rsplit("_x", 1)[0].rsplit("_", 1)[1]
         votes[player_num] = votes.get(player_num, 0) + 1
 
@@ -258,17 +273,20 @@ def vote_line_count(lines_df: pd.DataFrame) -> int:
 def analyze_lines(
     df: pd.DataFrame,
     team: str,
+    attacking_direction: int,
     min_line_gap: float = 0.0,
     force_n_lines: int | None = None,
 ) -> pd.DataFrame:
-    """
-    Add unit line assignments to every frame in df.
+    """Add unit line assignments to every frame in df.
 
     Adds {team}_{player}_line columns: 0 for GK, 1-4 for outfield, NaN if absent.
     Also adds line_count column with the number of lines detected per frame.
+
+    attacking_direction: +1 (team attacks toward positive x) or -1 (attacks left).
+    Determine this once per period with infer_attacking_direction(full_period_df, team).
     """
     result: pd.DataFrame = df.copy()
-    gk_num = find_goalkeeper(df, team)
+    gk_num = find_goalkeeper(df, team, attacking_direction)
     gk_x_col = f"{team}_{gk_num}_x"
 
     x_cols = [
