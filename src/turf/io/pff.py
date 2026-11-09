@@ -1,12 +1,22 @@
-"""Read PFF FC raw data (JSONL tracking + JSON events + JSON metadata).
+"""Read and write PFF FC raw data (JSONL tracking + JSON events + JSON metadata).
 
-Public entry point: load_match(data_dir, match_id) -> MatchData
+Public entry points:
+    load_match(data_dir, match_id)              -> MatchData   (from raw)
+    save_match(match, out_dir, match_id)        -> None        (to parquet)
+    read_match(out_dir, match_id)               -> MatchData   (from parquet)
+
+Column convention (tracking DataFrame):
+    period, time_s, ball_x, ball_y,
+    home_<jersey>_x, home_<jersey>_y,
+    away_<jersey>_x, away_<jersey>_y
+
+Team labels throughout: 'home' and 'away' (lowercase).
 """
 from __future__ import annotations
 
 import bz2
 import json
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
@@ -30,18 +40,26 @@ class AttackingDirections:
     away_p2: int
 
     def for_team(self, team: str, period: int) -> int:
-        """Return attacking direction for team ('Home'|'Away') and period (1|2)."""
-        if team == "Home":
+        """Return attacking direction for team ('home'|'away') and period (1|2).
+
+        Raises ValueError for periods other than 1 or 2 (extra time not yet
+        supported — homeTeamStartLeftExtraTime is in metadata but ignored here).
+        """
+        if period not in (1, 2):
+            raise ValueError(f"Period {period} not supported (only 1 or 2)")
+        if team == "home":
             return self.home_p1 if period == 1 else self.home_p2
-        return self.away_p1 if period == 1 else self.away_p2
+        if team == "away":
+            return self.away_p1 if period == 1 else self.away_p2
+        raise ValueError(f"Unknown team '{team}' — expected 'home' or 'away'")
 
 
 @dataclass
 class MatchData:
     """Preprocessed data for one match.
 
-    tracking   : wide DataFrame — Period, Time [s], ball_x, ball_y,
-                 Home_N_x, Home_N_y, Away_N_x, Away_N_y per player
+    tracking   : wide DataFrame — period, time_s, ball_x, ball_y,
+                 home_<jersey>_x/y, away_<jersey>_x/y per player
     events     : tidy DataFrame — one row per possession event
     directions : attacking direction per team per period
     meta       : raw metadata dict (fps, team names, period boundaries, …)
@@ -66,7 +84,7 @@ def _parse_meta(meta_path: Path) -> dict[str, Any]:
 def _attacking_directions(meta: dict[str, Any]) -> AttackingDirections:
     """Derive attacking directions from homeTeamStartLeft.
 
-    homeTeamStartLeft=True  → Home attacks right (+1) in period 1.
+    homeTeamStartLeft=True  → home attacks right (+1) in period 1.
     Teams swap in period 2.
     """
     home_starts_left: bool = bool(meta["homeTeamStartLeft"])
@@ -82,18 +100,18 @@ def _attacking_directions(meta: dict[str, Any]) -> AttackingDirections:
 def _parse_tracking(tracking_path: Path) -> pd.DataFrame:
     """Parse JSONL.bz2 tracking file → wide DataFrame.
 
-    Output columns:
-        Period, Time [s], ball_x, ball_y,
-        Home_<jerseyNum>_x, Home_<jerseyNum>_y,
-        Away_<jerseyNum>_x, Away_<jerseyNum>_y
+    Output columns (all lowercase, no spaces):
+        period, time_s, ball_x, ball_y,
+        home_<jersey>_x, home_<jersey>_y,
+        away_<jersey>_x, away_<jersey>_y
     """
     rows: list[dict[str, Any]] = []
     with bz2.open(tracking_path, "rt") as f:
         for line in f:
             frame: dict[str, Any] = json.loads(line)
             row: dict[str, Any] = {
-                "Period": int(frame["period"]),
-                "Time [s]": float(frame["periodElapsedTime"]),
+                "period": int(frame["period"]),
+                "time_s": float(frame["periodElapsedTime"]),
             }
 
             # ballsSmoothed is a single dict; balls is a list — handle both
@@ -116,20 +134,19 @@ def _parse_tracking(tracking_path: Path) -> pd.DataFrame:
             home = frame.get("homePlayersSmoothed") or frame.get("homePlayers") or []
             for p in home:
                 n = str(p["jerseyNum"])
-                row[f"Home_{n}_x"] = float(p["x"])
-                row[f"Home_{n}_y"] = float(p["y"])
+                row[f"home_{n}_x"] = float(p["x"])
+                row[f"home_{n}_y"] = float(p["y"])
 
             away = frame.get("awayPlayersSmoothed") or frame.get("awayPlayers") or []
             for p in away:
                 n = str(p["jerseyNum"])
-                row[f"Away_{n}_x"] = float(p["x"])
-                row[f"Away_{n}_y"] = float(p["y"])
+                row[f"away_{n}_x"] = float(p["x"])
+                row[f"away_{n}_y"] = float(p["y"])
 
             rows.append(row)
 
     df = pd.DataFrame(rows)
-    # Sort by period then time for consistent ordering
-    df = df.sort_values(["Period", "Time [s]"]).reset_index(drop=True)
+    df = df.sort_values(["period", "time_s"]).reset_index(drop=True)
     return df
 
 
@@ -141,13 +158,13 @@ def _parse_events(events_path: Path) -> pd.DataFrame:
         period, start_time, end_time,
         team_id, team_name, is_home,
         player_id, player_name,
-        event_type,           ← gameEventType (PASS, CARRY, etc.)
-        possession_type,      ← possessionEventType (PA, CR, etc.)
-        lines_broken,         ← linesBrokenType (NONE / MD / ATT / etc.)
-        ball_x, ball_y,       ← ball position at event start
+        event_type,       ← gameEventType (e.g. OTB, FIRSTKICKOFF)
+        possession_type,  ← possessionEventType (PA=pass, CR=carry, …)
+        lines_broken,     ← linesBrokenType (None / 'NONE' / 'MD' / 'ATT')
+        ball_x, ball_y,   ← ball position at event start
         passer_id, passer_name, receiver_id, receiver_name,
-        pass_outcome,
-        subtype,              ← gameEvents.subType
+        pass_outcome,     ← passOutcomeType (success / incomplete / …)
+        subtype,          ← gameEvents.subType
     """
     with open(events_path) as f:
         raw: list[dict[str, Any]] = json.load(f)
@@ -156,7 +173,7 @@ def _parse_events(events_path: Path) -> pd.DataFrame:
     for ev in raw:
         ge: dict[str, Any] = ev.get("gameEvents") or {}
         pe: dict[str, Any] = ev.get("possessionEvents") or {}
-        balls = ev.get("ball") or []
+        balls: list[dict[str, Any]] = ev.get("ball") or []
         bx = float(balls[0]["x"]) if balls else float("nan")
         by = float(balls[0]["y"]) if balls else float("nan")
 
@@ -198,7 +215,7 @@ def load_match(data_dir: str | Path, match_id: int | str) -> MatchData:
     data_dir should be the root of the raw PFF dataset, e.g.:
         data/raw/FIFA_WC_2022/
 
-    The function reads:
+    Reads:
         {data_dir}/Tracking Data/{match_id}.jsonl.bz2
         {data_dir}/Event Data/{match_id}.json
         {data_dir}/Metadata/{match_id}.json
@@ -217,3 +234,51 @@ def load_match(data_dir: str | Path, match_id: int | str) -> MatchData:
         directions=directions,
         meta=meta,
     )
+
+
+def save_match(match: MatchData, out_dir: str | Path, match_id: int | str) -> Path:
+    """Write a MatchData to parquet + JSON under {out_dir}/{match_id}/.
+
+    Creates the directory if needed. Returns the match directory path.
+
+    Requires pyarrow: uv sync --group io
+
+    Writes:
+        {out_dir}/{match_id}/tracking.parquet
+        {out_dir}/{match_id}/events.parquet
+        {out_dir}/{match_id}/directions.json
+        {out_dir}/{match_id}/meta.json
+    """
+    match_dir = Path(out_dir) / str(match_id)
+    match_dir.mkdir(parents=True, exist_ok=True)
+
+    match.tracking.to_parquet(match_dir / "tracking.parquet", index=False)
+    match.events.to_parquet(match_dir / "events.parquet", index=False)
+
+    with open(match_dir / "directions.json", "w") as f:
+        json.dump(asdict(match.directions), f)
+
+    with open(match_dir / "meta.json", "w") as f:
+        json.dump(match.meta, f)
+
+    return match_dir
+
+
+def read_match(out_dir: str | Path, match_id: int | str) -> MatchData:
+    """Load a MatchData previously saved with save_match.
+
+    Requires pyarrow: uv sync --group io
+    """
+    match_dir = Path(out_dir) / str(match_id)
+
+    tracking = pd.read_parquet(match_dir / "tracking.parquet")
+    events = pd.read_parquet(match_dir / "events.parquet")
+
+    with open(match_dir / "directions.json") as f:
+        dirs: dict[str, int] = json.load(f)
+    directions = AttackingDirections(**dirs)
+
+    with open(match_dir / "meta.json") as f:
+        meta: dict[str, Any] = json.load(f)
+
+    return MatchData(tracking=tracking, events=events, directions=directions, meta=meta)

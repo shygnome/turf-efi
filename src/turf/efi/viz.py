@@ -34,8 +34,8 @@ from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     import pandas as pd
-    from matplotlib.animation import FuncAnimation
-    from matplotlib.axes import Axes
+    from matplotlib.animation import FuncAnimation  # type: ignore[import-not-found]
+    from matplotlib.axes import Axes  # type: ignore[attr-defined]
     from mplsoccer import Pitch as PitchType  # type: ignore[import-untyped]
 
 # ── pitch / coordinate constants ───────────────────────────────────────────────
@@ -299,7 +299,7 @@ def animate_lines(
       }
     """
     from matplotlib.animation import FuncAnimation
-    from matplotlib.lines import Line2D
+    from matplotlib.lines import Line2D  # type: ignore[import-not-found]
 
     from turf.efi.line import smooth_line_assignments
 
@@ -481,7 +481,7 @@ def animate_lines(
         fig.patch.set_facecolor(theme["bg_color"])
 
     return FuncAnimation(
-        fig, _update,  # type: ignore[arg-type]
+        fig, _update,
         frames=n_frames + n_reveal,
         interval=1000.0 / fps,
         blit=False,
