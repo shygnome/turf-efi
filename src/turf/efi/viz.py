@@ -204,11 +204,23 @@ def plot_lines_frame(
     if theme is None:
         theme = _LIGHT_THEME
 
-    plot_frame(
-        ax, frame,
-        home_team=defending_team, away_team=attacking_team,
-        theme=theme,
-    )
+    # Identify defending GK from the _line column (line==0) so marker shape
+    # matches the algorithm's GK assignment, not a position heuristic.
+    def_gk_id = _find_gk_id_from_lines(frame, defending_team)
+    _draw_team(ax, frame, defending_team, alpha=1.0, theme=theme, gk_id=def_gk_id)
+    _draw_team(ax, frame, attacking_team, alpha=0.55, theme=theme)
+
+    # Ball
+    try:
+        bx, by = float(frame["ball_x"]), float(frame["ball_y"])
+        if not (math.isnan(bx) or math.isnan(by)):
+            ax.scatter(
+                [bx], [by],
+                c=_BALL_COLOR, s=100, zorder=7,
+                edgecolors=_BALL_EDGE, linewidths=1.5,
+            )
+    except (KeyError, TypeError, ValueError):
+        pass
 
     gk_x = _gk_x(frame, defending_team)
     lines_players: dict[int, list[tuple[float, float]]] = {}
@@ -389,7 +401,8 @@ def animate_lines(
             )
 
         # ── players ───────────────────────────────────────────────────────────
-        _draw_team(ax, row_def, defending_team, alpha=1.0, theme=theme)
+        def_gk = _find_gk_id_from_lines(row_def, defending_team)
+        _draw_team(ax, row_def, defending_team, alpha=1.0, theme=theme, gk_id=def_gk)
         _draw_team(ax, row_atk, attacking_team, alpha=0.5, theme=theme)
 
         # ── unit lines + depth panel ──────────────────────────────────────────
@@ -515,9 +528,11 @@ def _draw_team(
     team: str,
     alpha: float,
     theme: dict[str, str],
+    gk_id: str | None = None,
 ) -> None:
     color = _TEAM_COLORS.get(team, "#aaaaaa")
-    gk_id = _find_gk_id(row, team)
+    if gk_id is None:
+        gk_id = _find_gk_id(row, team)
     n = 1
     while True:
         xc, yc = f"{team}_{n}_x", f"{team}_{n}_y"
@@ -611,6 +626,8 @@ def _draw_depth_panel(
 
 
 def _find_gk_id(row: pd.Series, team: str) -> str | None:
+    """Fallback GK detection: furthest-back player by |x|.  Used when _line columns
+    are absent (e.g. plot_frame called before analyze_lines has run)."""
     best_id: str | None = None
     best_abs = -1.0
     n = 1
@@ -630,8 +647,32 @@ def _find_gk_id(row: pd.Series, team: str) -> str | None:
     return best_id
 
 
+def _find_gk_id_from_lines(row: pd.Series, team: str) -> str | None:
+    """GK detection from analyze_lines output: player where _line == 0.
+    Falls back to position-based _find_gk_id if no _line columns found."""
+    n = 1
+    found_any_line_col = False
+    while True:
+        xc = f"{team}_{n}_x"
+        if xc not in row.index:
+            break
+        lc = f"{team}_{n}_line"
+        if lc in row.index:
+            found_any_line_col = True
+            try:
+                if int(float(row[lc])) == 0:
+                    return str(n)
+            except (TypeError, ValueError):
+                pass
+        n += 1
+    # No _line column found — fall back to position heuristic
+    if not found_any_line_col:
+        return _find_gk_id(row, team)
+    return None
+
+
 def _gk_x(row: pd.Series, team: str) -> float:
-    gk_id = _find_gk_id(row, team)
+    gk_id = _find_gk_id_from_lines(row, team)
     if gk_id is None:
         return 0.0
     with contextlib.suppress(KeyError, TypeError, ValueError):
