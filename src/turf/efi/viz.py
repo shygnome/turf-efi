@@ -5,6 +5,11 @@ Developing module — see CLAUDE.md stability tiers.
 Requires the viz dependency group:
     uv sync --group viz
 
+Themes
+------
+Light theme (default) matches the jfa-wc26-analysis reference style.
+Pass dark=True to get the dark grass style.
+
 Data conventions
 ----------------
 Tracking frames are wide-format DataFrames with columns:
@@ -16,15 +21,16 @@ After analyze_lines, each player also has a {Team}_{n}_line column:
 Coordinates use the SkillCorner/centered system:
     x: −52.5 (own goal end) → +52.5 (opponent goal end)
     y: −34 (left touchline) → +34 (right touchline)
+
+Player index n in {Team}_{n}_x is used as the jersey number for display.
 """
 
 from __future__ import annotations
 
+import collections
 import contextlib
 import math
 from typing import TYPE_CHECKING, Any
-
-import numpy as np
 
 if TYPE_CHECKING:
     import pandas as pd
@@ -32,51 +38,99 @@ if TYPE_CHECKING:
     from matplotlib.axes import Axes
     from mplsoccer import Pitch as PitchType  # type: ignore[import-untyped]
 
-# ── style constants ────────────────────────────────────────────────────────────
+# ── pitch / coordinate constants ───────────────────────────────────────────────
 
-_PITCH_TYPE = "skillcorner"
+_PITCH_TYPE   = "skillcorner"
 _PITCH_LENGTH = 105
-_PITCH_WIDTH = 68
-_HALF_WIDTH = _PITCH_WIDTH / 2  # 34.0
-_YLIM_BOTTOM = -42.0
-_LABEL_Y = -38.0
+_PITCH_WIDTH  = 68
+_HALF_WIDTH   = _PITCH_WIDTH / 2    # 34.0
+_YLIM_BOTTOM  = -42.0
+_LABEL_Y      = -38.0
 
-_PITCH_COLOR = "#1a7a1a"
-_LINE_COLOR = "white"
-_BG_COLOR = "#0d0d0d"
+# ── themes (matches jfa-wc26-analysis animate_reception_event.py) ──────────────
+
+_LIGHT_THEME: dict[str, str] = {
+    "pitch_color": "#f5f5f0",
+    "line_color":  "#999999",
+    "bg_color":    "#ffffff",
+    "text_color":  "#111111",
+    "edge_color":  "#333333",
+    "num_color":   "white",    # jersey number text drawn on team-colored dots
+    "bar_bg":      "#e8e8e8",  # depth panel + legend background
+}
+
+_DARK_THEME: dict[str, str] = {
+    "pitch_color": "#1a7a1a",
+    "line_color":  "white",
+    "bg_color":    "#0d0d0d",
+    "text_color":  "white",
+    "edge_color":  "white",
+    "num_color":   "black",
+    "bar_bg":      "#222244",
+}
+
+# ── marker / color constants ───────────────────────────────────────────────────
 
 _TEAM_COLORS: dict[str, str] = {
     "Home": "#4e79a7",
     "Away": "#e15759",
 }
+
 _DEFENSIVE_LINE_COLORS: dict[int, str] = {
     1: "#4e79a7",
     2: "#59a14f",
     3: "#f28e2b",
     4: "#e15759",
 }
-_GK_EDGE_COLOR = "lime"
-_BALL_COLOR = "#FFA500"
-_TRAIL_RGB = (1.0, 0.647, 0.0)
-_TRAIL_ALPHA_MIN = 0.08
-_TRAIL_ALPHA_MAX = 0.65
-_MAX_LINES = 4
+
+_BALL_COLOR = "white"
+_BALL_EDGE  = "#555555"
+
+_TRAIL_LEN       = 15
+_TRAIL_ALPHA_MIN = 0.06
+_TRAIL_ALPHA_MAX = 0.50
+_MAX_LINES       = 4
+
+# Line depth panel (axes-fraction units, bottom-left corner)
+_DP_X0     = 0.04    # left edge of bar track
+_DP_Y0     = 0.06    # bottom bar centre-y
+_DP_BAR_H  = 0.038   # bar height
+_DP_STRIDE = 0.065   # vertical gap between bar centres
+_DP_W_MAX  = 0.20    # max bar width (proportion of axes width)
+_DP_MAX_M  = 52.5    # x-axis max for depth normalisation
+
 
 # ── public pitch factory ───────────────────────────────────────────────────────
 
 
-def make_pitch(half: bool = False) -> PitchType:
-    """Return a configured mplsoccer Pitch (dark grass style)."""
+def make_pitch(
+    half: bool = False,
+    dark: bool = False,
+) -> tuple[PitchType, dict[str, str]]:
+    """Return a configured (Pitch, theme) pair.
+
+    Light theme (default) matches the jfa-wc26-analysis reference style.
+    Pass dark=True for the dark grass / dark background style.
+
+    Usage::
+
+        pitch, theme = make_pitch()
+        fig, ax = pitch.draw(figsize=(12, 8))
+        fig.patch.set_facecolor(theme["bg_color"])
+    """
     from mplsoccer import Pitch
 
-    return Pitch(
+    theme = _DARK_THEME if dark else _LIGHT_THEME
+    pitch = Pitch(
         pitch_type=_PITCH_TYPE,
         pitch_length=_PITCH_LENGTH,
         pitch_width=_PITCH_WIDTH,
-        pitch_color=_PITCH_COLOR,
-        line_color=_LINE_COLOR,
+        pitch_color=theme["pitch_color"],
+        line_color=theme["line_color"],
+        linewidth=0.8,
         half=half,
     )
+    return pitch, theme
 
 
 # ── static frame plots ─────────────────────────────────────────────────────────
@@ -87,16 +141,20 @@ def plot_frame(
     frame: pd.Series,
     home_team: str = "Home",
     away_team: str = "Away",
+    theme: dict[str, str] | None = None,
 ) -> None:
     """Plot players and ball for a single wide-format tracking row.
 
     home_team players are drawn solid; away_team at reduced alpha.
-    Goalkeepers are rendered as diamond markers.
+    GK: square (s) marker.  Outfielders: circle (o) marker.
+    Jersey number (player index n) shown inside each marker.
     """
+    if theme is None:
+        theme = _LIGHT_THEME
+
     for team, alpha in [(home_team, 1.0), (away_team, 0.55)]:
         color = _TEAM_COLORS.get(team, "#aaaaaa")
         gk_id = _find_gk_id(frame, team)
-        out_xs, out_ys, gk_xs, gk_ys = [], [], [], []
         n = 1
         while True:
             xc, yc = f"{team}_{n}_x", f"{team}_{n}_y"
@@ -105,27 +163,17 @@ def plot_frame(
             try:
                 xf, yf = float(frame[xc]), float(frame[yc])
                 if not (math.isnan(xf) or math.isnan(yf)):
-                    if str(n) == gk_id:
-                        gk_xs.append(xf)
-                        gk_ys.append(yf)
-                    else:
-                        out_xs.append(xf)
-                        out_ys.append(yf)
+                    _draw_player(
+                        ax, xf, yf, color,
+                        is_gk=(str(n) == gk_id),
+                        label=str(n),
+                        alpha=alpha,
+                        edge_color=theme["edge_color"],
+                        num_color=theme["num_color"],
+                    )
             except (TypeError, ValueError):
                 pass
             n += 1
-        if out_xs:
-            ax.scatter(
-                out_xs, out_ys,
-                c=color, s=140, zorder=4, alpha=alpha,
-                edgecolors="white", linewidths=0.8,
-            )
-        if gk_xs:
-            ax.scatter(
-                gk_xs, gk_ys,
-                c=color, s=170, marker="D", zorder=5, alpha=alpha,
-                edgecolors=_GK_EDGE_COLOR, linewidths=1.5,
-            )
 
     # Ball
     try:
@@ -133,8 +181,8 @@ def plot_frame(
         if not (math.isnan(bx) or math.isnan(by)):
             ax.scatter(
                 [bx], [by],
-                c=_BALL_COLOR, s=100, zorder=6,
-                edgecolors="black", linewidths=1.0,
+                c=_BALL_COLOR, s=100, zorder=7,
+                edgecolors=_BALL_EDGE, linewidths=1.5,
             )
     except (KeyError, TypeError, ValueError):
         pass
@@ -145,14 +193,34 @@ def plot_lines_frame(
     frame: pd.Series,
     defending_team: str,
     attacking_team: str,
+    theme: dict[str, str] | None = None,
 ) -> None:
     """Plot a tracking frame with defensive unit line overlays.
 
     frame must have {defending_team}_{n}_line columns (from analyze_lines output).
-    Each non-GK line is drawn as a zig-zag connecting players and a dashed
-    representative-x vertical line, labelled L1…L4.
+    Each non-GK line is drawn as a zig-zag with a dashed representative-x vertical,
+    labelled L1…L4 (L1 = most advanced line).
     """
-    plot_frame(ax, frame, home_team=defending_team, away_team=attacking_team)
+    if theme is None:
+        theme = _LIGHT_THEME
+
+    # Identify defending GK from the _line column (line==0) so marker shape
+    # matches the algorithm's GK assignment, not a position heuristic.
+    def_gk_id = _find_gk_id_from_lines(frame, defending_team)
+    _draw_team(ax, frame, defending_team, alpha=1.0, theme=theme, gk_id=def_gk_id)
+    _draw_team(ax, frame, attacking_team, alpha=0.55, theme=theme)
+
+    # Ball
+    try:
+        bx, by = float(frame["ball_x"]), float(frame["ball_y"])
+        if not (math.isnan(bx) or math.isnan(by)):
+            ax.scatter(
+                [bx], [by],
+                c=_BALL_COLOR, s=100, zorder=7,
+                edgecolors=_BALL_EDGE, linewidths=1.5,
+            )
+    except (KeyError, TypeError, ValueError):
+        pass
 
     gk_x = _gk_x(frame, defending_team)
     lines_players: dict[int, list[tuple[float, float]]] = {}
@@ -161,13 +229,14 @@ def plot_lines_frame(
         xc = f"{defending_team}_{n}_x"
         if xc not in frame.index:
             break
-        yc = f"{defending_team}_{n}_y"
+        yc       = f"{defending_team}_{n}_y"
         line_col = f"{defending_team}_{n}_line"
         try:
-            xf = float(frame[xc])
-            yf = float(frame[yc])
+            xf     = float(frame[xc])
+            yf     = float(frame[yc])
             ln_raw = (
-                float(frame[line_col]) if line_col in frame.index else float("nan")
+                float(frame[line_col])
+                if line_col in frame.index else float("nan")
             )
             if not (math.isnan(xf) or math.isnan(yf) or math.isnan(ln_raw)):
                 lines_players.setdefault(int(ln_raw), []).append((xf, yf))
@@ -175,25 +244,22 @@ def plot_lines_frame(
             pass
         n += 1
 
-    # Sort lines by distance from GK (ascending abs x) → L1 = most advanced
     active = {
-        ln: players
-        for ln, players in lines_players.items()
-        if ln != 0 and players
+        ln: pts
+        for ln, pts in lines_players.items()
+        if ln != 0 and pts
     }
-    sorted_lns = sorted(
-        active, key=lambda ln: abs(_repr_x(active[ln], gk_x))
-    )
+    sorted_lns = sorted(active, key=lambda ln: abs(_repr_x(active[ln], gk_x)))
     for user_idx, ln in enumerate(sorted_lns, start=1):
-        players = active[ln]
+        pts   = active[ln]
         color = _DEFENSIVE_LINE_COLORS.get(user_idx, "white")
-        sorted_p = sorted(players, key=lambda p: p[1])
-        if len(sorted_p) >= 2:
+        sp    = sorted(pts, key=lambda p: p[1])
+        if len(sp) >= 2:
             ax.plot(
-                [p[0] for p in sorted_p], [p[1] for p in sorted_p],
+                [p[0] for p in sp], [p[1] for p in sp],
                 color=color, lw=2.0, alpha=0.85, zorder=5,
             )
-        rx = _repr_x(players, gk_x)
+        rx = _repr_x(pts, gk_x)
         ax.axvline(rx, color=color, linestyle="--", lw=1.2, alpha=0.5, zorder=3)
         ax.text(
             rx, _LABEL_Y, f"L{user_idx}",
@@ -213,6 +279,8 @@ def animate_lines(
     metadata: dict[str, Any],
     fps: float = 25.0,
     smooth_lines: bool = True,
+    dark: bool = False,
+    show_depth_panel: bool = True,
     pass_labels: dict[str, Any] | None = None,
     freeze_duration: float = 5.0,
 ) -> FuncAnimation:
@@ -232,303 +300,339 @@ def animate_lines(
     """
     from matplotlib.animation import FuncAnimation
     from matplotlib.lines import Line2D
-    from matplotlib.text import Text
 
     from turf.efi.line import smooth_line_assignments
 
     if smooth_lines:
         defending_frames = smooth_line_assignments(defending_frames, defending_team)
 
-    first_def_row = defending_frames.iloc[0]
-    gk_id = _find_gk_id(first_def_row, defending_team)
-    def_gk_x: float = 0.0
-    if gk_id is not None:
-        gk_xcol = f"{defending_team}_{gk_id}_x"
-        with contextlib.suppress(KeyError, TypeError, ValueError):
-            def_gk_x = float(first_def_row[gk_xcol])
-
-    pitch = make_pitch()
-    fig, ax = pitch.draw()
+    pitch, theme = make_pitch(dark=dark)
+    fig, ax      = pitch.draw(figsize=(13, 8.5))
     ax.set_ylim(_YLIM_BOTTOM, _HALF_WIDTH)
-    fig.patch.set_facecolor(_BG_COLOR)
+    fig.patch.set_facecolor(theme["bg_color"])
 
     n_frames = min(len(defending_frames), len(attacking_frames))
+    n_reveal = int(freeze_duration * fps) if pass_labels is not None else 0
+    period   = metadata.get("period", 1)
 
-    # Stable L-label mapping: L1 = most advanced (lowest abs repr_x)
-    last_lp = _players_by_line(defending_frames.iloc[-1], defending_team)
-    last_repr_xs: dict[int, float] = {
-        ln: _repr_x(last_lp[ln], def_gk_x)
+    # Stable L-label mapping: L1 = most advanced line
+    gk_x0   = _gk_x(defending_frames.iloc[0], defending_team)
+    last_lp  = _players_by_line(defending_frames.iloc[-1], defending_team)
+    last_rx: dict[int, float] = {
+        ln: _repr_x(last_lp[ln], gk_x0)
         for ln in range(1, _MAX_LINES + 1)
         if last_lp.get(ln)
     }
-    sorted_by_advance = sorted(last_repr_xs, key=lambda ln: abs(last_repr_xs[ln]))
-    ln_to_user_stable: dict[int, int] = {
-        ln: i + 1 for i, ln in enumerate(sorted_by_advance)
+    ln_to_user: dict[int, int] = {
+        ln: i + 1
+        for i, ln in enumerate(sorted(last_rx, key=lambda k: abs(last_rx[k])))
     }
 
-    atk_gk_id = _find_gk_id(attacking_frames.iloc[0], attacking_team)
+    start_ball = _ball_xy(defending_frames.iloc[0])
+    end_ball   = _ball_xy(defending_frames.iloc[-1])
 
-    ball_trail: list[tuple[float, float] | None] = [
-        _ball_xy(defending_frames.iloc[i]) for i in range(n_frames)
-    ]
-    start_ball = ball_trail[0] if ball_trail else None
-    end_ball = ball_trail[-1] if ball_trail else None
-
-    # ── artists ───────────────────────────────────────────────────────────────
-    atk_color = _TEAM_COLORS.get(attacking_team, "gray")
-    def_color = _TEAM_COLORS.get(defending_team, "gray")
-
-    atk_out_scat = ax.scatter([], [], c=atk_color, s=120, alpha=0.5, zorder=3)
-    atk_gk_scat = ax.scatter(
-        [], [], c=atk_color, marker="D", s=160,
-        edgecolors=_GK_EDGE_COLOR, linewidths=2, alpha=0.5, zorder=5,
+    # Ball trail deque
+    ball_trail: collections.deque[tuple[float, float] | None] = collections.deque(
+        maxlen=_TRAIL_LEN
     )
-    def_out_scat = ax.scatter([], [], c=def_color, s=140, zorder=4)
-    def_gk_scat = ax.scatter(
-        [], [], c=def_color, marker="D", s=160,
-        edgecolors=_GK_EDGE_COLOR, linewidths=2, zorder=5,
+
+    # Legend (fig-level so ax.cla() doesn't remove it)
+    def_color = _TEAM_COLORS.get(defending_team, "#aaaaaa")
+    atk_color = _TEAM_COLORS.get(attacking_team, "#aaaaaa")
+    fig.legend(
+        handles=[
+            Line2D(
+                [], [], color=def_color, marker="o", ms=7, lw=0,
+                label=f"{defending_team} (def.)",
+            ),
+            Line2D(
+                [], [], color=def_color, marker="s", ms=7, lw=0,
+                label=f"{defending_team} GK",
+            ),
+            Line2D(
+                [], [], color=atk_color, marker="o", ms=7, lw=0, alpha=0.5,
+                label=f"{attacking_team} (atk.)",
+            ),
+            Line2D(
+                [], [], color=atk_color, marker="s", ms=7, lw=0, alpha=0.5,
+                label=f"{attacking_team} GK",
+            ),
+            Line2D(
+                [], [], color=_BALL_COLOR, marker="o", ms=7, lw=0,
+                markeredgecolor=_BALL_EDGE, label="Ball",
+            ),
+        ],
+        loc="lower center",
+        ncol=5,
+        facecolor=theme["bar_bg"],
+        labelcolor=theme["text_color"],
+        fontsize=7.5,
+        framealpha=0.9,
+        bbox_to_anchor=(0.5, 0.01),
     )
-    ball_scat = ax.scatter(
-        [], [], c=_BALL_COLOR, edgecolors="black", s=80, zorder=6,
-    )
-    trail_scat = ax.scatter([], [], s=18, edgecolors="none", zorder=5)
 
-    zigzag_lines: dict[int, Any] = {}
-    repr_lines: dict[int, Any] = {}
-    line_labels: dict[int, Text] = {}
-    for ln in range(1, _MAX_LINES + 1):
-        (zz,) = ax.plot(
-            [], [], color=_DEFENSIVE_LINE_COLORS[ln], lw=1.5, alpha=0.7, zorder=3
-        )
-        zigzag_lines[ln] = zz
-        (rl,) = ax.plot(
-            [], [], color=_DEFENSIVE_LINE_COLORS[ln],
-            linestyle="--", lw=1.5, alpha=0.5, zorder=2,
-        )
-        repr_lines[ln] = rl
-        line_labels[ln] = ax.text(
-            0.0, _LABEL_Y, "",
-            color=_DEFENSIVE_LINE_COLORS[ln], fontsize=8, rotation=45,
-            ha="center", va="top", visible=False,
-        )
-
-    # legend
-    legend_handles = [
-        Line2D(
-            [], [], color=def_color, marker="o", ms=7, lw=0,
-            label=f"{defending_team} (def.)",
-        ),
-        Line2D(
-            [], [], color=def_color, marker="D", ms=7, lw=0,
-            markeredgecolor=_GK_EDGE_COLOR, markeredgewidth=1.5,
-            label=f"{defending_team} GK",
-        ),
-        Line2D(
-            [], [], color=atk_color, marker="o", ms=7, lw=0, alpha=0.5,
-            label=f"{attacking_team} (atk.)",
-        ),
-        Line2D(
-            [], [], color=atk_color, marker="D", ms=7, lw=0,
-            markeredgecolor=_GK_EDGE_COLOR, markeredgewidth=1.5, alpha=0.5,
-            label=f"{attacking_team} GK",
-        ),
-    ]
-    ax.legend(handles=legend_handles, loc="upper right", fontsize=7, framealpha=0.7)
-    title = ax.set_title("")
-    period = metadata.get("period", 1)
-
-    # pass_labels reveal phase
-    n_reveal = int(freeze_duration * fps) if pass_labels is not None else 0
-    hull_patches: list[Any] = []
-    pass_arrow = None
-    passer_ring = None
-    receiver_ring = None
-    info_text = None
-
-    if pass_labels is not None:
-        import matplotlib.patches as mpatches
-
-        hv_list = pass_labels.get("hull_vertices")
-        if hv_list and isinstance(hv_list, list):
-            for hv in hv_list:
-                if hv and len(hv) >= 3:
-                    patch = mpatches.Polygon(
-                        hv, closed=True, fill=False, hatch="////",
-                        edgecolor="#FFB300", lw=1.0, visible=False, zorder=2,
-                    )
-                    ax.add_patch(patch)
-                    hull_patches.append(patch)
-
-        if start_ball is not None and end_ball is not None:
-            pass_arrow = mpatches.FancyArrowPatch(
-                posA=start_ball, posB=end_ball,
-                arrowstyle="->,head_width=4,head_length=3",
-                color="white", lw=2.5, visible=False, zorder=8,
-            )
-            ax.add_patch(pass_arrow)
-
-        passer_ring = ax.scatter(
-            [], [], s=350, facecolors="none", edgecolors="yellow", lw=2.5, zorder=9,
-        )
-        receiver_ring = ax.scatter(
-            [], [], s=350, facecolors="none", edgecolors="lime", lw=2.5, zorder=9,
-        )
-        info_text = ax.text(
-            -48.0, 22.0, "", color="white", fontsize=9, va="top",
-            bbox={"facecolor": "#111111", "alpha": 0.8, "boxstyle": "round"},
-            visible=False, zorder=10,
-        )
-
-    # ── static start-ball marker ──────────────────────────────────────────────
-    if start_ball is not None:
-        sbx, sby = start_ball
-        ax.scatter(
-            [sbx], [sby], color="yellow", edgecolors="darkorange",
-            marker="*", s=140, lw=1.5, zorder=7,
-        )
-
-    def _update(frame_i: int) -> tuple[object, ...]:
-        eff = min(frame_i, n_frames - 1)
+    def _update(frame_i: int) -> None:
+        eff    = min(frame_i, n_frames - 1)
         reveal = frame_i - n_frames
+
+        ax.cla()
+        pitch.draw(ax=ax)
+        ax.set_ylim(_YLIM_BOTTOM, _HALF_WIDTH)
 
         row_def = defending_frames.iloc[eff]
         row_atk = attacking_frames.iloc[eff]
 
-        # attacking team
-        atk_all = _player_xy_with_ids(row_atk, attacking_team)
-        atk_out = [(x, y) for pid, x, y in atk_all if pid != atk_gk_id]
-        atk_gk = [(x, y) for pid, x, y in atk_all if pid == atk_gk_id]
-        atk_out_scat.set_offsets(atk_out if atk_out else np.empty((0, 2)))
-        atk_gk_scat.set_offsets(atk_gk if atk_gk else np.empty((0, 2)))
+        # ── ball trail ────────────────────────────────────────────────────────
+        if reveal < 0:
+            ball_trail.append(_ball_xy(row_def))
 
-        # ball
-        bp = _ball_xy(row_def)
-        ball_scat.set_offsets([[bp[0], bp[1]]] if bp else np.empty((0, 2)))
-
-        # ball trail
-        valid_trail = [p for p in ball_trail[: eff + 1] if p is not None]
-        if valid_trail:
-            n_t = len(valid_trail)
-            alphas = (
-                np.array([_TRAIL_ALPHA_MAX])
-                if n_t == 1
-                else np.linspace(_TRAIL_ALPHA_MIN, _TRAIL_ALPHA_MAX, n_t)
+        n_tr = len(ball_trail)
+        for tidx, bp in enumerate(ball_trail):
+            if bp is None:
+                continue
+            alpha  = _TRAIL_ALPHA_MIN + (_TRAIL_ALPHA_MAX - _TRAIL_ALPHA_MIN) * (
+                tidx / max(n_tr - 1, 1)
             )
-            rgba = np.empty((n_t, 4))
-            rgba[:, 0], rgba[:, 1], rgba[:, 2] = _TRAIL_RGB
-            rgba[:, 3] = alphas
-            trail_scat.set_offsets(valid_trail)
-            trail_scat.set_facecolor(rgba)
-        else:
-            trail_scat.set_offsets(np.empty((0, 2)))
+            sz_fac = 0.3 + 0.5 * (tidx / max(n_tr - 1, 1))
+            ax.scatter(
+                bp[0], bp[1],
+                c=_BALL_COLOR, s=int(60 * sz_fac),
+                alpha=alpha, zorder=3, edgecolors="none",
+            )
 
-        # defending team
+        # ── players ───────────────────────────────────────────────────────────
+        def_gk = _find_gk_id_from_lines(row_def, defending_team)
+        _draw_team(ax, row_def, defending_team, alpha=1.0, theme=theme, gk_id=def_gk)
+        _draw_team(ax, row_atk, attacking_team, alpha=0.5, theme=theme)
+
+        # ── unit lines + depth panel ──────────────────────────────────────────
         line_players = _players_by_line(row_def, defending_team)
-        gk_pl = line_players.get(0, [])
-        def_gk_scat.set_offsets(gk_pl if gk_pl else np.empty((0, 2)))
-        all_out = [
-            p for ln in range(1, _MAX_LINES + 1) for p in line_players.get(ln, [])
-        ]
-        def_out_scat.set_offsets(all_out if all_out else np.empty((0, 2)))
-
-        repr_xs_active: dict[int, float] = {
-            ln: _repr_x(line_players[ln], def_gk_x)
-            for ln in range(1, _MAX_LINES + 1)
-            if line_players.get(ln)
+        active_lns: dict[int, list[tuple[float, float]]] = {
+            ln: pts
+            for ln, pts in line_players.items()
+            if ln != 0 and pts
         }
+        for ln, pts in active_lns.items():
+            user_ln = ln_to_user.get(ln, ln)
+            color   = _DEFENSIVE_LINE_COLORS.get(user_ln, "white")
+            sp      = sorted(pts, key=lambda p: p[1])
+            if len(sp) >= 2:
+                ax.plot(
+                    [p[0] for p in sp], [p[1] for p in sp],
+                    color=color, lw=2.0, alpha=0.85, zorder=5,
+                )
+            rx = _repr_x(pts, gk_x0)
+            ax.axvline(rx, color=color, linestyle="--", lw=1.2, alpha=0.4, zorder=3)
+            ax.text(
+                rx, _LABEL_Y, f"L{user_ln}",
+                color=color, fontsize=8, ha="center", va="top",
+                fontweight="bold", zorder=6,
+            )
 
-        for ln in range(1, _MAX_LINES + 1):
-            players = line_players.get(ln, [])
-            if players:
-                user_ln = ln_to_user_stable.get(ln, ln)
-                color = _DEFENSIVE_LINE_COLORS[user_ln]
-                sorted_p = sorted(players, key=lambda p: p[1])
-                if len(sorted_p) >= 2:
-                    zigzag_lines[ln].set_data(
-                        [p[0] for p in sorted_p], [p[1] for p in sorted_p]
-                    )
-                else:
-                    zigzag_lines[ln].set_data([], [])
-                zigzag_lines[ln].set_color(color)
-                rx = repr_xs_active[ln]
-                repr_lines[ln].set_data([rx, rx], [-_HALF_WIDTH, _HALF_WIDTH])
-                repr_lines[ln].set_color(color)
-                line_labels[ln].set_position((rx, _LABEL_Y))
-                line_labels[ln].set_text(f"L{user_ln}")
-                line_labels[ln].set_color(color)
-                line_labels[ln].set_visible(pass_labels is None or reveal < 0)
-            else:
-                zigzag_lines[ln].set_data([], [])
-                repr_lines[ln].set_data([], [])
-                line_labels[ln].set_visible(False)
+        if show_depth_panel and active_lns:
+            _draw_depth_panel(ax, active_lns, ln_to_user, gk_x0, theme)
 
-        ts = _timestamp_str(row_def, period)
-        title.set_text(f"Unit Lines | {ts}")
+        # ── ball ──────────────────────────────────────────────────────────────
+        bp = _ball_xy(row_def)
+        if bp:
+            ax.scatter(
+                [bp[0]], [bp[1]],
+                c=_BALL_COLOR, s=130, zorder=7,
+                edgecolors=_BALL_EDGE, linewidths=1.5,
+            )
 
-        reveal_artists: tuple[object, ...] = ()
-        if pass_labels is not None:
-            p1 = int(fps * 1)
-            p2 = int(fps * 2)
-            p3 = int(fps * 3)
-            for hp in hull_patches:
-                hp.set_visible(reveal >= p1)
-            if pass_arrow is not None:
-                pass_arrow.set_visible(reveal >= p2)
-            if passer_ring is not None and receiver_ring is not None:
-                if reveal >= p2:
-                    if start_ball is not None:
-                        pp = _closest_player(
-                            attacking_frames.iloc[0], attacking_team, *start_ball
-                        )
-                        passer_ring.set_offsets([pp] if pp else np.empty((0, 2)))
-                    if end_ball is not None:
-                        rp = _closest_player(
-                            attacking_frames.iloc[-1], attacking_team, *end_ball
-                        )
-                        receiver_ring.set_offsets([rp] if rp else np.empty((0, 2)))
-                else:
-                    passer_ring.set_offsets(np.empty((0, 2)))
-                    receiver_ring.set_offsets(np.empty((0, 2)))
-            if info_text is not None:
-                info_text.set_visible(reveal >= p3)
-                if reveal >= p3 and not info_text.get_text():
-                    info_text.set_text(_build_info_text(pass_labels))
+        # ── pass reveal phase ─────────────────────────────────────────────────
+        if pass_labels is not None and reveal >= 0:
+            import matplotlib.patches as mpatches
 
-            ra: list[object] = [*hull_patches]
-            if pass_arrow is not None:
-                ra.append(pass_arrow)
-            if passer_ring is not None:
-                ra.append(passer_ring)
-            if receiver_ring is not None:
-                ra.append(receiver_ring)
-            if info_text is not None:
-                ra.append(info_text)
-            reveal_artists = tuple(ra)
+            hv_list = pass_labels.get("hull_vertices") or []
+            if reveal >= int(fps * 1):
+                for hv in hv_list:
+                    if hv and len(hv) >= 3:
+                        ax.add_patch(mpatches.Polygon(
+                            hv, closed=True, fill=False, hatch="////",
+                            edgecolor="#FFB300", lw=1.0, zorder=2,
+                        ))
 
-        return (
-            atk_out_scat, atk_gk_scat, trail_scat, ball_scat,
-            def_out_scat, def_gk_scat,
-            *zigzag_lines.values(), *repr_lines.values(),
-            *line_labels.values(),
-            title,
-            *reveal_artists,
+            if reveal >= int(fps * 2) and start_ball and end_ball:
+                ax.add_patch(mpatches.FancyArrowPatch(
+                    posA=start_ball, posB=end_ball,
+                    arrowstyle="->,head_width=4,head_length=3",
+                    color=theme["text_color"], lw=2.5, zorder=8,
+                ))
+
+            if reveal >= int(fps * 3):
+                ax.text(
+                    -48.0, 22.0, _build_info_text(pass_labels),
+                    color=theme["text_color"], fontsize=9, va="top",
+                    bbox={
+                        "facecolor": theme["bar_bg"],
+                        "alpha": 0.85,
+                        "boxstyle": "round",
+                    },
+                    zorder=10,
+                )
+
+        # ── title ─────────────────────────────────────────────────────────────
+        ax.set_title(
+            f"Unit Lines  |  {_timestamp_str(row_def, period)}",
+            color=theme["text_color"], fontsize=10, pad=8,
         )
-
+        fig.patch.set_facecolor(theme["bg_color"])
 
     return FuncAnimation(
         fig, _update,  # type: ignore[arg-type]
         frames=n_frames + n_reveal,
         interval=1000.0 / fps,
-        blit=True,
+        blit=False,
     )
 
 
-# ── private helpers ────────────────────────────────────────────────────────────
+# ── private draw helpers ───────────────────────────────────────────────────────
+
+
+def _draw_player(
+    ax: Axes,
+    xf: float,
+    yf: float,
+    color: str,
+    is_gk: bool,
+    label: str,
+    alpha: float,
+    edge_color: str,
+    num_color: str,
+) -> None:
+    marker = "s" if is_gk else "o"
+    size   = 200 if is_gk else 160
+    edgew  = 1.5 if is_gk else 0.8
+    ax.scatter(
+        [xf], [yf],
+        c=color, s=size, marker=marker,
+        zorder=4 + int(is_gk),
+        alpha=alpha,
+        edgecolors=edge_color,
+        linewidths=edgew,
+    )
+    ax.text(
+        xf, yf, label,
+        fontsize=5.5, ha="center", va="center",
+        color=num_color, fontweight="bold",
+        zorder=6 + int(is_gk),
+        alpha=alpha,
+    )
+
+
+def _draw_team(
+    ax: Axes,
+    row: pd.Series,
+    team: str,
+    alpha: float,
+    theme: dict[str, str],
+    gk_id: str | None = None,
+) -> None:
+    color = _TEAM_COLORS.get(team, "#aaaaaa")
+    if gk_id is None:
+        gk_id = _find_gk_id(row, team)
+    n = 1
+    while True:
+        xc, yc = f"{team}_{n}_x", f"{team}_{n}_y"
+        if xc not in row.index:
+            break
+        try:
+            xf, yf = float(row[xc]), float(row[yc])
+            if not (math.isnan(xf) or math.isnan(yf)):
+                _draw_player(
+                    ax, xf, yf, color,
+                    is_gk=(str(n) == gk_id),
+                    label=str(n),
+                    alpha=alpha,
+                    edge_color=theme["edge_color"],
+                    num_color=theme["num_color"],
+                )
+        except (TypeError, ValueError):
+            pass
+        n += 1
+
+
+def _draw_depth_panel(
+    ax: Axes,
+    active_lns: dict[int, list[tuple[float, float]]],
+    ln_to_user: dict[int, int],
+    gk_x: float,
+    theme: dict[str, str],
+) -> None:
+    """Draw the line depth panel in the bottom-left corner (axes-fraction coords).
+
+    Each detected line gets a bar proportional to its depth from the GK,
+    labelled L1–L4 with the matching line color.
+    """
+    import matplotlib.patches as mpatches
+
+    n_lines  = len(active_lns)
+    tc       = theme["text_color"]
+    bg       = theme["bar_bg"]
+    is_light = bg.startswith("#e")
+    track_bg = "#c8c8c8" if is_light else "#444466"
+
+    panel_h = _DP_BAR_H + (n_lines - 1) * _DP_STRIDE + 0.02
+    ax.add_patch(mpatches.FancyBboxPatch(
+        (_DP_X0 - 0.035, _DP_Y0 - 0.015),
+        _DP_W_MAX + 0.065, panel_h,
+        boxstyle="round,pad=0.005",
+        transform=ax.transAxes,
+        fc=bg, ec="none", alpha=0.82, zorder=20,
+    ))
+
+    sorted_lns = sorted(
+        active_lns, key=lambda ln: abs(_repr_x(active_lns[ln], gk_x))
+    )
+    for i, ln in enumerate(sorted_lns):
+        user_ln  = ln_to_user.get(ln, ln)
+        color    = _DEFENSIVE_LINE_COLORS.get(user_ln, "white")
+        rx       = _repr_x(active_lns[ln], gk_x)
+        depth    = max(0.0, abs(rx) - abs(gk_x))
+        bar_frac = min(depth / _DP_MAX_M, 1.0)
+        bar_w    = bar_frac * _DP_W_MAX
+        yc       = _DP_Y0 + i * _DP_STRIDE
+
+        # Track background
+        ax.add_patch(mpatches.Rectangle(
+            (_DP_X0, yc - _DP_BAR_H / 2), _DP_W_MAX, _DP_BAR_H,
+            transform=ax.transAxes,
+            fc=track_bg, ec="none", alpha=0.4, zorder=21,
+        ))
+        # Filled bar
+        if bar_w > 0:
+            ax.add_patch(mpatches.Rectangle(
+                (_DP_X0, yc - _DP_BAR_H / 2), bar_w, _DP_BAR_H,
+                transform=ax.transAxes,
+                fc=color, ec="none", alpha=0.88, zorder=22,
+            ))
+        # Line label
+        ax.text(
+            _DP_X0 - 0.012, yc, f"L{user_ln}",
+            transform=ax.transAxes, ha="right", va="center",
+            fontsize=7, color=color, fontweight="bold", zorder=23,
+        )
+        # Depth value
+        ax.text(
+            _DP_X0 + _DP_W_MAX + 0.010, yc, f"{depth:.1f} m",
+            transform=ax.transAxes, ha="left", va="center",
+            fontsize=6.5, color=tc, fontweight="bold", zorder=23,
+        )
+
+
+# ── private data helpers ───────────────────────────────────────────────────────
 
 
 def _find_gk_id(row: pd.Series, team: str) -> str | None:
-    best_id: str | None = None
-    best_abs = -1.0
+    """Fallback GK detection used when _line columns are absent.
+
+    Infers defending direction from the team's median x (negative → defending
+    left, positive → defending right), then picks the signed extreme player.
+    This avoids misidentifying an outfielder who pushed into the opponent's half.
+    """
+    x_vals: dict[str, float] = {}
     n = 1
     while True:
         xc = f"{team}_{n}_x"
@@ -536,18 +640,46 @@ def _find_gk_id(row: pd.Series, team: str) -> str | None:
             break
         try:
             xf = float(row[xc])
-            a = abs(xf)
-            if not math.isnan(a) and a > best_abs:
-                best_abs = a
-                best_id = str(n)
+            if not math.isnan(xf):
+                x_vals[str(n)] = xf
         except (TypeError, ValueError):
             pass
         n += 1
-    return best_id
+    if not x_vals:
+        return None
+    xs = list(x_vals.values())
+    median_x = sorted(xs)[len(xs) // 2]
+    if median_x < 0:
+        return min(x_vals, key=lambda k: x_vals[k])
+    return max(x_vals, key=lambda k: x_vals[k])
+
+
+def _find_gk_id_from_lines(row: pd.Series, team: str) -> str | None:
+    """GK detection from analyze_lines output: player where _line == 0.
+    Falls back to position-based _find_gk_id if no _line columns found."""
+    n = 1
+    found_any_line_col = False
+    while True:
+        xc = f"{team}_{n}_x"
+        if xc not in row.index:
+            break
+        lc = f"{team}_{n}_line"
+        if lc in row.index:
+            found_any_line_col = True
+            try:
+                if int(float(row[lc])) == 0:
+                    return str(n)
+            except (TypeError, ValueError):
+                pass
+        n += 1
+    # No _line column found — fall back to position heuristic
+    if not found_any_line_col:
+        return _find_gk_id(row, team)
+    return None
 
 
 def _gk_x(row: pd.Series, team: str) -> float:
-    gk_id = _find_gk_id(row, team)
+    gk_id = _find_gk_id_from_lines(row, team)
     if gk_id is None:
         return 0.0
     with contextlib.suppress(KeyError, TypeError, ValueError):
@@ -642,10 +774,10 @@ def _timestamp_str(row: pd.Series, period: object) -> str:
 
 
 def _build_info_text(pass_labels: dict[str, Any]) -> str:
-    is_lb = pass_labels.get("is_line_breaking")
-    lbc = pass_labels.get("lines_broken_count", 0)
+    is_lb     = pass_labels.get("is_line_breaking")
+    lbc       = pass_labels.get("lines_broken_count", 0)
     direction = pass_labels.get("direction_per_line", [])
-    location = pass_labels.get("location_after_break")
+    location  = pass_labels.get("location_after_break")
     lines = [
         f"Line-breaking: {'Yes' if is_lb else 'No'}",
         f"Lines broken: {lbc}",
