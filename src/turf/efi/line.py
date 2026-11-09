@@ -11,20 +11,32 @@ from scipy.cluster.hierarchy import fcluster, linkage  # type: ignore[import-unt
 def find_goalkeeper(df: pd.DataFrame, team: str) -> str:
     """Return player ID of the goalkeeper by majority vote across all frames.
 
-    For each frame the player with the highest abs(x) is nominated; the player
-    nominated most often across the clip is returned.  This is robust to
-    occasional tracklet swaps that would fool a single-frame heuristic.
+    Defending direction (which end of the pitch this team protects) is inferred
+    from the median player x across all frames: negative median → defending the
+    left goal (GK has the minimum x per frame); positive median → defending the
+    right goal (GK has the maximum x per frame).  Using the signed extreme rather
+    than abs().idxmax() prevents outfield players who push far into the opponent's
+    half from being misidentified as the goalkeeper.
+
+    Majority vote across frames is robust to occasional tracklet swaps.
     """
     x_cols = [c for c in df.columns if c.startswith(team + "_") and c.endswith("_x")]
     if not x_cols:
         raise ValueError(f"No {team} player positions found")
+
+    # Infer defending direction from overall median x
+    all_x: npt.NDArray[np.float64] = df[x_cols].values.flatten().astype(np.float64)
+    all_x = all_x[~np.isnan(all_x)]
+    if len(all_x) == 0:
+        raise ValueError(f"No {team} player positions in any frame")
+    defending_left: bool = bool(np.median(all_x) < 0)
 
     votes: dict[str, int] = {}
     for _, row in df.iterrows():
         valid = row[x_cols].dropna()
         if valid.empty:
             continue
-        gk_col = str(valid.abs().idxmax())
+        gk_col = str(valid.idxmin() if defending_left else valid.idxmax())
         player_num = gk_col.rsplit("_x", 1)[0].rsplit("_", 1)[1]
         votes[player_num] = votes.get(player_num, 0) + 1
 

@@ -626,10 +626,13 @@ def _draw_depth_panel(
 
 
 def _find_gk_id(row: pd.Series, team: str) -> str | None:
-    """Fallback GK detection: furthest-back player by |x|.  Used when _line columns
-    are absent (e.g. plot_frame called before analyze_lines has run)."""
-    best_id: str | None = None
-    best_abs = -1.0
+    """Fallback GK detection used when _line columns are absent.
+
+    Infers defending direction from the team's median x (negative → defending
+    left, positive → defending right), then picks the signed extreme player.
+    This avoids misidentifying an outfielder who pushed into the opponent's half.
+    """
+    x_vals: dict[str, float] = {}
     n = 1
     while True:
         xc = f"{team}_{n}_x"
@@ -637,14 +640,18 @@ def _find_gk_id(row: pd.Series, team: str) -> str | None:
             break
         try:
             xf = float(row[xc])
-            a  = abs(xf)
-            if not math.isnan(a) and a > best_abs:
-                best_abs = a
-                best_id  = str(n)
+            if not math.isnan(xf):
+                x_vals[str(n)] = xf
         except (TypeError, ValueError):
             pass
         n += 1
-    return best_id
+    if not x_vals:
+        return None
+    xs = list(x_vals.values())
+    median_x = sorted(xs)[len(xs) // 2]
+    if median_x < 0:
+        return min(x_vals, key=lambda k: x_vals[k])
+    return max(x_vals, key=lambda k: x_vals[k])
 
 
 def _find_gk_id_from_lines(row: pd.Series, team: str) -> str | None:

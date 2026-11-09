@@ -48,7 +48,7 @@ def _event_df() -> pd.DataFrame:
 
 
 class TestFindGoalkeeper:
-    def test_returns_player_with_highest_abs_x(self) -> None:
+    def test_defending_right_extreme_positive_x(self) -> None:
         df = _away_df(**{"2": 10.0, "3": 44.0, "4": 18.0})
         assert find_goalkeeper(df, "Away") == "3"
 
@@ -74,9 +74,33 @@ class TestFindGoalkeeper:
         ]
         assert find_goalkeeper(pd.DataFrame(rows), "Away") == "1"
 
-    def test_negative_x_side(self) -> None:
+    def test_defending_left_extreme_negative_x(self) -> None:
         df = _away_df(**{"2": -5.0, "3": -43.0, "4": -12.0})
         assert find_goalkeeper(df, "Away") == "3"
+
+    def test_direction_aware_outfielder_pushed_into_opponent_half_right(self) -> None:
+        # Bug: team defends RIGHT (positive x). Real GK at +40, but outfielder
+        # (player 16) pushed all the way to -42. abs().idxmax() picks 16 (wrong).
+        # Direction-aware detection should pick player 1 (GK at +40).
+        rows = [
+            {
+                "Away_1_x": 40.0,   # GK — defending right goal
+                "Away_16_x": -42.0,  # outfielder pushed far forward
+                "Away_2_x": 15.0, "Away_3_x": 10.0, "Away_4_x": 5.0,
+            }
+        ] * 5
+        assert find_goalkeeper(pd.DataFrame(rows), "Away") == "1"
+
+    def test_direction_aware_outfielder_pushed_into_opponent_half_left(self) -> None:
+        # Symmetric: team defends LEFT. GK at -40, outfielder at +42.
+        rows = [
+            {
+                "Away_1_x": -40.0,  # GK — defending left goal
+                "Away_16_x": 42.0,   # outfielder pushed far forward
+                "Away_2_x": -15.0, "Away_3_x": -10.0, "Away_4_x": -5.0,
+            }
+        ] * 5
+        assert find_goalkeeper(pd.DataFrame(rows), "Away") == "1"
 
 
 # ── detect_lines_frame ────────────────────────────────────────────────────────
