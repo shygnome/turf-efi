@@ -13,16 +13,17 @@ Pass dark=True to get the dark grass style.
 Data conventions
 ----------------
 Tracking frames are wide-format DataFrames with columns:
-    Period, Time [s], {Team}_{n}_x, {Team}_{n}_y, ball_x, ball_y
+    period, time_s, {team}_{n}_x, {team}_{n}_y, ball_x, ball_y
+    (team label is lowercase: 'home' or 'away')
 
-After analyze_lines, each player also has a {Team}_{n}_line column:
+After analyze_lines, each player also has a {team}_{n}_line column:
     0 = goalkeeper, 1–4 = outfield defensive lines (front to back)
 
 Coordinates use the SkillCorner/centered system:
     x: −52.5 (own goal end) → +52.5 (opponent goal end)
     y: −34 (left touchline) → +34 (right touchline)
 
-Player index n in {Team}_{n}_x is used as the jersey number for display.
+Player index n in {team}_{n}_x is used as the jersey number for display.
 """
 
 from __future__ import annotations
@@ -34,8 +35,8 @@ from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     import pandas as pd
-    from matplotlib.animation import FuncAnimation
-    from matplotlib.axes import Axes
+    from matplotlib.animation import FuncAnimation  # type: ignore[import-not-found]
+    from matplotlib.axes import Axes  # type: ignore[attr-defined]
     from mplsoccer import Pitch as PitchType  # type: ignore[import-untyped]
 
 # ── pitch / coordinate constants ───────────────────────────────────────────────
@@ -299,7 +300,7 @@ def animate_lines(
       }
     """
     from matplotlib.animation import FuncAnimation
-    from matplotlib.lines import Line2D
+    from matplotlib.lines import Line2D  # type: ignore[import-not-found]
 
     from turf.efi.line import smooth_line_assignments
 
@@ -481,7 +482,7 @@ def animate_lines(
         fig.patch.set_facecolor(theme["bg_color"])
 
     return FuncAnimation(
-        fig, _update,  # type: ignore[arg-type]
+        fig, _update,
         frames=n_frames + n_reveal,
         interval=1000.0 / fps,
         blit=False,
@@ -765,7 +766,7 @@ def _closest_player(
 
 def _timestamp_str(row: pd.Series, period: object) -> str:
     try:
-        secs = int(float(row["Time [s]"]))
+        secs = int(float(row.get("time_s", row.get("Time [s]", 0))))
         m, s = divmod(secs, 60)
         half = "H1" if int(str(period)) == 1 else "H2"
         return f"{half} {m:02d}:{s:02d}"

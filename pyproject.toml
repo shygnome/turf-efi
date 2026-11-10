@@ -32,6 +32,9 @@ nb = [
     "jupyterlab>=4.0",
     "ipykernel>=6.0",
 ]
+io = [
+    "pyarrow>=14.0",
+]
 
 [tool.uv.build-backend]
 module-name = "turf.efi"
