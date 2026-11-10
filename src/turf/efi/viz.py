@@ -13,16 +13,17 @@ Pass dark=True to get the dark grass style.
 Data conventions
 ----------------
 Tracking frames are wide-format DataFrames with columns:
-    Period, Time [s], {Team}_{n}_x, {Team}_{n}_y, ball_x, ball_y
+    period, time_s, {team}_{n}_x, {team}_{n}_y, ball_x, ball_y
+    (team label is lowercase: 'home' or 'away')
 
-After analyze_lines, each player also has a {Team}_{n}_line column:
+After analyze_lines, each player also has a {team}_{n}_line column:
     0 = goalkeeper, 1–4 = outfield defensive lines (front to back)
 
 Coordinates use the SkillCorner/centered system:
     x: −52.5 (own goal end) → +52.5 (opponent goal end)
     y: −34 (left touchline) → +34 (right touchline)
 
-Player index n in {Team}_{n}_x is used as the jersey number for display.
+Player index n in {team}_{n}_x is used as the jersey number for display.
 """
 
 from __future__ import annotations
@@ -765,7 +766,7 @@ def _closest_player(
 
 def _timestamp_str(row: pd.Series, period: object) -> str:
     try:
-        secs = int(float(row["Time [s]"]))
+        secs = int(float(row.get("time_s", row.get("Time [s]", 0))))
         m, s = divmod(secs, 60)
         half = "H1" if int(str(period)) == 1 else "H2"
         return f"{half} {m:02d}:{s:02d}"

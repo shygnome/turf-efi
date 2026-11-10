@@ -31,6 +31,9 @@ src/
       label.py        ← line-break labeling for pass/dribble events
       risk.py         ← xT-based risk model for line-breaking passes
       viz.py          ← pitch visualization (developing; requires viz extras)
+    io/
+      __init__.py     ← public API re-exports
+      pff.py          ← PFF FC raw data loader (developing; requires io extras)
 tests/
   fixtures/           ← synthetic tracking frames only (no real data)
   test_line.py
@@ -42,6 +45,9 @@ experiments/
     notebook.ipynb    ← committed; all results inside are gitignored
     results/          ← gitignored
 data/                 ← gitignored (real tracking data — never commit)
+  raw/                ← original source files (PFF FC JSONL.bz2 + JSON)
+  processed/          ← parquet outputs from save_match
+  archived/           ← old CSV-based datasets kept for reference
 ```
 
 ### Namespace package
@@ -55,10 +61,38 @@ tree without coordination.
 from turf.efi.line import detect_lines_frame, analyze_lines
 from turf.efi.label import label_event, detect_line_break
 from turf.efi.risk import build_expected_xt
+
+# io extras required: uv sync --group io
+from turf.io.pff import load_match, save_match, read_match
 ```
 
 Never add `src/turf/__init__.py`. If the main `turf` package is also installed,
 both coexist cleanly in the namespace.
+
+---
+
+## Tracking DataFrame column convention
+
+All tracking DataFrames — whether loaded from raw PFF data via `turf.io.pff`
+or constructed in tests/experiments — must follow this convention:
+
+| Column pattern          | Type    | Description                              |
+|-------------------------|---------|------------------------------------------|
+| `period`                | int     | Match period (1 or 2)                    |
+| `time_s`                | float   | Elapsed time within period (seconds)     |
+| `ball_x`, `ball_y`      | float   | Ball position; NaN when not visible      |
+| `home_<jersey>_x/y`     | float   | Home player position by jersey number    |
+| `away_<jersey>_x/y`     | float   | Away player position by jersey number    |
+
+**Team labels are always lowercase:** `'home'` and `'away'`.
+
+The column names are all lowercase, no spaces. Jersey numbers are strings
+(`'1'`, `'10'`, `'23'`). Column presence is sparse — a player column only
+exists in frames where that player appeared at least once.
+
+Older experiment notebooks may reference the legacy PFF CSV column names
+(`Period`, `Time [s]`, `Home 1 x`, `Away 1 x`). Do not create new code
+using those names.
 
 ---
 
@@ -103,12 +137,14 @@ New modules under active research. TDD is encouraged but not enforced.
 When a developing module stabilises, add it to the stable table above
 and retroactively close any missing test coverage before merging.
 
-To add a new developing module, create it under `turf/efi/` and add a
-row to the table below (no approval process, just track it):
+To add a new developing module, create it under `turf/efi/` (or a new
+namespace under `src/turf/`) and add a row to the table below (no
+approval process, just track it):
 
 | Module              | Status      | Notes                                |
 |---------------------|-------------|--------------------------------------|
 | `turf.efi.viz`      | developing  | mplsoccer pitch plots; needs viz extras (`uv sync --group viz`) |
+| `turf.io.pff`       | developing  | PFF FC raw data loader; needs io extras (`uv sync --group io`) |
 
 ---
 
